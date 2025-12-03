@@ -1,0 +1,2 @@
+# Sample targets (static, public docs). Replace or extend as needed.
+https://platform.openai.com/docs/overview
