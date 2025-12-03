@@ -530,7 +530,7 @@ def process_url(
     # Skip rewrite if content hash unchanged and file exists.
     existing_path = dest_dir / filename
     if cache_entry and cache_entry.get("hash") == html_hash and existing_path.exists():
-        return existing_path
+        return existing_path, html_hash, title
 
     markdown = convert_to_markdown(
         html,
