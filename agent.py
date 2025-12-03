@@ -18,7 +18,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, List, Optional, Set
 from urllib.parse import urlparse
 from urllib import robotparser
 
@@ -361,6 +361,14 @@ def main() -> int:
     robots_policy = None if args.skip_robots else RobotsPolicy(USER_AGENT)
     cache = load_cache(args.cache_file)
 
+    handled_exceptions = (
+        PermissionError,
+        RuntimeError,
+        requests.RequestException,
+        OSError,
+        ValueError,
+    )
+
     for url in urls:
         try:
             dest = process_url(
@@ -376,7 +384,7 @@ def main() -> int:
                 browser_wait_until=args.browser_wait_until,
             )
             print(f"Saved {url} -> {dest}")
-        except Exception as exc:  # pragma: no cover - operational guard
+        except handled_exceptions as exc:  # pragma: no cover - operational guard
             print(f"Failed to process {url}: {exc}", file=sys.stderr)
     return 0
 
