@@ -59,3 +59,52 @@ def test_not_modified_returns_cached_path(monkeypatch, tmp_path):
     )
 
     assert path == cached_file
+
+
+def test_robots_policy_is_cached(monkeypatch):
+    called = []
+
+    class FakeRobotParser:
+        def __init__(self):
+            self.url = None
+
+        def set_url(self, url):
+            self.url = url
+
+        def read(self):
+            called.append(self.url)
+
+        def can_fetch(self, user_agent, url):
+            return url.endswith("/ok")
+
+    monkeypatch.setattr(agent.robotparser, "RobotFileParser", FakeRobotParser)
+
+    policy = agent.RobotsPolicy(user_agent="TestAgent")
+    assert policy.is_allowed("https://example.com/ok") is True
+    assert policy.is_allowed("https://example.com/blocked") is False
+    # Subsequent calls should reuse cached parser, so read called once.
+    assert called == ["https://example.com/robots.txt"]
+
+
+def test_cache_round_trip(tmp_path):
+    cache_file = tmp_path / "cache.json"
+    cache = {"https://example.com": {"etag": "abc", "last_modified": "yesterday"}}
+    agent.save_cache(cache_file, cache)
+    loaded = agent.load_cache(cache_file)
+    assert loaded == cache
+
+
+def test_convert_to_markdown_strips_selectors():
+    html = """
+    <html><body>
+        <nav>nav content</nav>
+        <main><a href="/docs">Docs</a></main>
+    </body></html>
+    """
+    md = agent.convert_to_markdown(
+        html,
+        "https://example.com/base",
+        strip_selectors=["nav"],
+    )
+    assert "nav content" not in md
+    assert "https://example.com/docs" in md

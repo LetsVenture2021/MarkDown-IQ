@@ -18,7 +18,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from urllib import robotparser
 
@@ -36,6 +36,7 @@ except ImportError as exc:  # pragma: no cover - dependency guard
 
 USER_AGENT = "DocHarvester/0.1 (+https://example.com; for personal documentation use)"
 DEFAULT_MIN_DELAY = 1.0
+DEFAULT_MAX_RETRIES = 2
 DEFAULT_CACHE_PATH = Path(".cache/harvest_cache.json")
 
 
@@ -101,10 +102,27 @@ def parse_args() -> argparse.Namespace:
         help=f"Minimum seconds between fetches (default: {DEFAULT_MIN_DELAY}).",
     )
     parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help=f"Retry count for transient errors (default: {DEFAULT_MAX_RETRIES}).",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=1.5,
+        help="Seconds for first retry backoff; doubles each attempt (default: 1.5).",
+    )
+    parser.add_argument(
         "--cache-file",
         type=Path,
         default=DEFAULT_CACHE_PATH,
         help="Path to cache file for ETag/Last-Modified tracking.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignore cache read/write entirely.",
     )
     parser.add_argument(
         "--force",
@@ -133,6 +151,46 @@ def parse_args() -> argparse.Namespace:
         choices=["load", "domcontentloaded", "networkidle", "commit"],
         default="networkidle",
         help="Playwright wait_until state (default: networkidle).",
+    )
+    parser.add_argument(
+        "--crawl",
+        action="store_true",
+        help="Discover same-domain links from seed URLs before fetching.",
+    )
+    parser.add_argument(
+        "--max-crawl-pages",
+        type=int,
+        default=20,
+        help="Maximum discovered URLs to add when crawling (default: 20).",
+    )
+    parser.add_argument(
+        "--allow-pattern",
+        action="append",
+        default=[],
+        help="Regex allowlist for discovered URLs (repeatable).",
+    )
+    parser.add_argument(
+        "--deny-pattern",
+        action="append",
+        default=[],
+        help="Regex denylist for discovered URLs (repeatable).",
+    )
+    parser.add_argument(
+        "--strip-selectors",
+        action="append",
+        default=[],
+        help="CSS selectors to remove before Markdown conversion (repeatable).",
+    )
+    parser.add_argument(
+        "--keep-selectors",
+        action="append",
+        default=[],
+        help="If set, only keep elements matching these selectors (repeatable).",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="Write run report to JSON or CSV at this path.",
     )
     return parser.parse_args()
 
@@ -167,6 +225,43 @@ def fetch_html(url: str) -> str:
     return resp.text
 
 
+def normalize_links(soup: BeautifulSoup, base_url: str) -> None:
+    parsed_base = urlparse(base_url)
+    if not parsed_base.scheme or not parsed_base.netloc:
+        return
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]
+        tag["href"] = requests.compat.urljoin(base_url, href)
+
+
+def prune_soup(
+    soup: BeautifulSoup,
+    strip_selectors: Optional[List[str]] = None,
+    keep_selectors: Optional[List[str]] = None,
+) -> BeautifulSoup:
+    strip_selectors = strip_selectors or []
+    keep_selectors = keep_selectors or []
+    body = soup.body or soup
+
+    for selector in strip_selectors:
+        for tag in body.select(selector):
+            tag.decompose()
+
+    if keep_selectors:
+        kept_nodes = []
+        for selector in keep_selectors:
+            kept_nodes.extend(body.select(selector))
+        new_body = BeautifulSoup("<body></body>", "html.parser").body
+        for node in kept_nodes:
+            new_body.append(node.extract())
+        if soup.body:
+            soup.body.replace_with(new_body)
+        else:
+            soup = BeautifulSoup("<html></html>", "html.parser")
+            soup.append(new_body)
+    return soup
+
+
 def extract_title(soup: BeautifulSoup) -> str:
     if soup.title and soup.title.string:
         return soup.title.string.strip()
@@ -197,6 +292,85 @@ def load_cache(path: Path) -> Dict[str, dict]:
 def save_cache(path: Path, cache: Dict[str, dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def with_retries(
+    func, max_retries: int, backoff: float, retry_exceptions: tuple[type[Exception], ...]
+):
+    attempt = 0
+    while True:
+        try:
+            return func()
+        except retry_exceptions:
+            attempt += 1
+            if attempt > max_retries:
+                raise
+            sleep_for = backoff * (2 ** (attempt - 1))
+            time.sleep(sleep_for)
+
+
+def compile_patterns(patterns: List[str]) -> List[re.Pattern[str]]:
+    compiled = []
+    for pat in patterns:
+        try:
+            compiled.append(re.compile(pat))
+        except re.error:
+            continue
+    return compiled
+
+
+def url_matches_patterns(
+    url: str, allow: List[re.Pattern[str]], deny: List[re.Pattern[str]]
+) -> bool:
+    if deny and any(p.search(url) for p in deny):
+        return False
+    if allow:
+        return any(p.search(url) for p in allow)
+    return True
+
+
+def discover_urls(
+    seed_urls: List[str],
+    max_pages: int,
+    allow_patterns: List[re.Pattern[str]],
+    deny_patterns: List[re.Pattern[str]],
+    limiter: Optional[RateLimiter],
+    robots_policy: Optional[RobotsPolicy],
+) -> List[str]:
+    queue = list(seed_urls)
+    seen: Set[str] = set(seed_urls)
+    discovered: List[str] = []
+
+    while queue and len(discovered) < max_pages:
+        current = queue.pop(0)
+        parsed_current = urlparse(current)
+        base_domain = parsed_current.netloc
+        try:
+            with maybe_rate_limited(limiter):
+                html = fetch_html(current)
+        except Exception:
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        for link in soup.find_all("a", href=True):
+            target = requests.compat.urljoin(current, link["href"])
+            parsed_target = urlparse(target)
+            if parsed_target.netloc != base_domain:
+                continue
+            if target in seen:
+                continue
+            if robots_policy and not robots_policy.is_allowed(target):
+                continue
+            if not url_matches_patterns(target, allow_patterns, deny_patterns):
+                continue
+
+            discovered.append(target)
+            seen.add(target)
+            queue.append(target)
+            if len(discovered) >= max_pages:
+                break
+
+    return discovered
 
 
 @contextmanager
@@ -250,13 +424,20 @@ def fetch_with_playwright(
     return html, None, None
 
 
-def convert_to_markdown(html: str, url: str) -> str:
+def convert_to_markdown(
+    html: str,
+    url: str,
+    strip_selectors: Optional[List[str]] = None,
+    keep_selectors: Optional[List[str]] = None,
+) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
     # Drop script/style to keep noise out of Markdown.
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
+    normalize_links(soup, url)
+    soup = prune_soup(soup, strip_selectors=strip_selectors, keep_selectors=keep_selectors)
     title = extract_title(soup)
     body_html = str(soup.body or soup)
     markdown = html_to_md(body_html, heading_style="ATX").strip()
@@ -289,41 +470,57 @@ def process_url(
     force: bool,
     browser_timeout_ms: int,
     browser_wait_until: str,
-) -> Path:
+    use_cache: bool,
+    max_retries: int,
+    retry_backoff: float,
+    strip_selectors: Optional[List[str]],
+    keep_selectors: Optional[List[str]],
+) -> tuple[Path, str, str]:
     if robots_policy and not robots_policy.is_allowed(url):
         raise PermissionError(f"Blocked by robots.txt: {url}")
 
-    cache_entry = cache.get(url)
+    cache_entry = cache.get(url) if use_cache else None
     html: Optional[str] = None
     etag: Optional[str] = None
     last_modified: Optional[str] = None
 
-    try:
+    retryable = (requests.RequestException, RuntimeError, OSError, ValueError)
+
+    def perform_fetch():
         if use_browser:
-            html, etag, last_modified = fetch_with_playwright(
+            return fetch_with_playwright(
                 url,
                 limiter=limiter,
                 timeout_ms=browser_timeout_ms,
                 wait_until=browser_wait_until,
             )
-        else:
-            html, etag, last_modified = fetch_with_requests(
-                url,
-                cache_entry=cache_entry,
-                limiter=limiter,
-                force=force,
-            )
+        return fetch_with_requests(
+            url,
+            cache_entry=cache_entry,
+            limiter=limiter,
+            force=force,
+        )
+
+    try:
+        html, etag, last_modified = with_retries(
+            perform_fetch, max_retries=max_retries, backoff=retry_backoff, retry_exceptions=retryable
+        )
     except NotModified:
         if cache_entry and (existing := cache_entry.get("filename")):
             path = dest_dir / existing
             if path.exists():
-                return path
+                return path, cache_entry.get("hash", ""), cache_entry.get("title", "")
         # If cache said not modified but file missing, force fetch.
-        html, etag, last_modified = fetch_with_requests(
-            url,
-            cache_entry=None,
-            limiter=limiter,
-            force=True,
+        html, etag, last_modified = with_retries(
+            lambda: fetch_with_requests(
+                url,
+                cache_entry=None,
+                limiter=limiter,
+                force=True,
+            ),
+            max_retries=max_retries,
+            backoff=retry_backoff,
+            retry_exceptions=retryable,
         )
 
     html_hash = hashlib.sha256(html.encode("utf-8")).hexdigest()
@@ -335,19 +532,41 @@ def process_url(
     if cache_entry and cache_entry.get("hash") == html_hash and existing_path.exists():
         return existing_path
 
-    markdown = convert_to_markdown(html, url)
+    markdown = convert_to_markdown(
+        html,
+        url,
+        strip_selectors=strip_selectors,
+        keep_selectors=keep_selectors,
+    )
     path = write_markdown(markdown, dest_dir, filename)
 
-    cache[url] = {
-        "etag": etag,
-        "last_modified": last_modified,
-        "filename": filename,
-        "title": title,
-        "hash": html_hash,
-        "fetched_at": dt.datetime.utcnow().isoformat() + "Z",
-    }
-    save_cache(cache_path, cache)
-    return path
+    if use_cache:
+        cache[url] = {
+            "etag": etag,
+            "last_modified": last_modified,
+            "filename": filename,
+            "title": title,
+            "hash": html_hash,
+            "fetched_at": dt.datetime.utcnow().isoformat() + "Z",
+        }
+        save_cache(cache_path, cache)
+    return path, html_hash, title
+
+
+def write_report(report_path: Path, results: List[dict]) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = report_path.suffix.lower()
+    if suffix == ".csv":
+        import csv
+
+        fieldnames = sorted({k for r in results for k in r.keys()})
+        with report_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in results:
+                writer.writerow(row)
+    else:
+        report_path.write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def main() -> int:
@@ -357,9 +576,35 @@ def main() -> int:
         print("No URLs provided. Use --url or --url-file.", file=sys.stderr)
         return 1
 
+    if args.use_browser:
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore  # noqa: F401
+        except ImportError as exc:  # pragma: no cover - optional dependency guard
+            print(
+                "Playwright not installed. Install with: pip install playwright && playwright install chromium",
+                file=sys.stderr,
+            )
+            return 1
+
     limiter = RateLimiter(args.min_delay) if args.min_delay > 0 else None
     robots_policy = None if args.skip_robots else RobotsPolicy(USER_AGENT)
-    cache = load_cache(args.cache_file)
+    allow_patterns = compile_patterns(args.allow_pattern)
+    deny_patterns = compile_patterns(args.deny_pattern)
+
+    if args.crawl and urls:
+        discovered = discover_urls(
+            seed_urls=urls,
+            max_pages=args.max_crawl_pages,
+            allow_patterns=allow_patterns,
+            deny_patterns=deny_patterns,
+            limiter=limiter,
+            robots_policy=robots_policy,
+        )
+        for new_url in discovered:
+            if new_url not in urls:
+                urls.append(new_url)
+
+    cache = {} if args.no_cache else load_cache(args.cache_file)
 
     handled_exceptions = (
         PermissionError,
@@ -369,9 +614,12 @@ def main() -> int:
         ValueError,
     )
 
+    results: List[dict] = []
+    failures = 0
+
     for url in urls:
         try:
-            dest = process_url(
+            dest, html_hash, title = process_url(
                 url=url,
                 dest_dir=args.out_dir,
                 limiter=limiter,
@@ -382,11 +630,36 @@ def main() -> int:
                 force=args.force,
                 browser_timeout_ms=args.browser_timeout,
                 browser_wait_until=args.browser_wait_until,
+                use_cache=not args.no_cache,
+                max_retries=max(0, args.max_retries),
+                retry_backoff=max(0.0, args.retry_backoff),
+                strip_selectors=args.strip_selectors,
+                keep_selectors=args.keep_selectors,
             )
             print(f"Saved {url} -> {dest}")
+            results.append(
+                {
+                    "url": url,
+                    "status": "ok",
+                    "path": str(dest),
+                    "hash": html_hash,
+                    "title": title,
+                }
+            )
         except handled_exceptions as exc:  # pragma: no cover - operational guard
+            failures += 1
             print(f"Failed to process {url}: {exc}", file=sys.stderr)
-    return 0
+            results.append({"url": url, "status": "error", "error": str(exc)})
+
+    print(f"Completed: {len(urls) - failures} ok, {failures} failed.")
+    if args.report:
+        try:
+            write_report(args.report, results)
+            print(f"Wrote report to {args.report}")
+        except Exception as exc:  # pragma: no cover - guard
+            print(f"Failed to write report: {exc}", file=sys.stderr)
+
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

@@ -14,7 +14,10 @@ Agent for fetching public documentation pages (e.g., OpenAI docs), converting th
 python agent.py --url https://platform.openai.com/docs/overview
 python agent.py --url-file urls.txt --out-dir docs --min-delay 1.5
 python agent.py --url-file urls.txt --use-browser   # Playwright for dynamic pages
+python agent.py --url-file urls.txt --crawl --max-crawl-pages 10 --allow-pattern docs
+python agent.py --url-file urls.txt --strip-selectors nav --strip-selectors footer
 python agent.py --url-file urls.txt --force         # Ignore cache
+python agent.py --url-file urls.txt --report run.json --max-retries 3 --retry-backoff 2.0
 ```
 
 Options:
@@ -22,12 +25,18 @@ Options:
 - `--url-file`: path to a file containing URLs (one per line, `#` = comment).
 - `--out-dir`: output directory for generated `.md` files (default: `docs`).
 - `--min-delay`: throttle between requests (seconds, default 1.0).
+- `--max-retries` / `--retry-backoff`: transient error retries with exponential backoff.
 - `--cache-file`: where to store fetch metadata (default: `.cache/harvest_cache.json`).
+- `--no-cache`: bypass cache reads/writes.
 - `--force`: ignore cache and re-fetch.
 - `--skip-robots`: bypass robots.txt enforcement (only when permitted by site terms).
 - `--use-browser`: fetch with Playwright headless Chromium for dynamic pages.
 - `--browser-timeout`: Playwright navigation timeout (ms).
 - `--browser-wait-until`: Playwright wait condition (`load`, `domcontentloaded`, `networkidle`, `commit`).
+- `--crawl`: discover same-domain links from seed URLs before fetching.
+- `--allow-pattern` / `--deny-pattern`: regex filters for crawled links.
+- `--strip-selectors` / `--keep-selectors`: remove or only keep matching CSS selectors before Markdown conversion.
+- `--report`: write a JSON or CSV report of run results.
 
 ## Responsibilities and limits
 - Only fetch pages you are permitted to access; respect site Terms of Service and `robots.txt`.
