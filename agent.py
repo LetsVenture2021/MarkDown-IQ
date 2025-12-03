@@ -7,6 +7,7 @@ locally with simple metadata for downstream AI use.
 
 Use responsibly: respect robots.txt and site Terms of Service.
 """
+# pylint: disable=missing-function-docstring,missing-class-docstring,line-too-long
 from __future__ import annotations
 
 import argparse
@@ -18,7 +19,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 from urllib.parse import urlparse
 from urllib import robotparser
 
@@ -27,11 +28,11 @@ try:
     from bs4 import BeautifulSoup
     from markdownify import markdownify as html_to_md
 except ImportError as exc:  # pragma: no cover - dependency guard
-    missing = (
+    MISSING_DEPS_MSG = (
         "Missing dependencies. Install with: pip install -r requirements.txt\n"
         f"Original error: {exc}"
     )
-    print(missing, file=sys.stderr)
+    print(MISSING_DEPS_MSG, file=sys.stderr)
     sys.exit(1)
 
 USER_AGENT = "DocHarvester/0.1 (+https://example.com; for personal documentation use)"
@@ -74,7 +75,7 @@ class RobotsPolicy:
             rp.set_url(base + "/robots.txt")
             try:
                 rp.read()
-            except Exception:
+            except (OSError, IOError, requests.RequestException):
                 # If robots.txt cannot be read, default to disallow to be safe.
                 return False
             self._parsers[base] = rp
@@ -285,7 +286,19 @@ def load_cache(path: Path) -> Dict[str, dict]:
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except json.JSONDecodeError:
+        # If cache is corrupted JSON, move it aside so users can inspect it.
+        try:
+            corrupt_name = path.with_name(path.name + ".corrupt-" + dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"))
+            path.replace(corrupt_name)
+            print(f"Warning: cache file corrupted; moved to {corrupt_name}", file=sys.stderr)
+        except OSError:
+            # If we cannot rename, silently continue and return empty cache.
+            pass
+        return {}
+    except OSError:
+        # IO problems (permission, etc.) — return empty cache but surface nothing
+        # to keep behavior consistent with prior implementation.
         return {}
 
 
@@ -348,7 +361,7 @@ def discover_urls(
         try:
             with maybe_rate_limited(limiter):
                 html = fetch_html(current)
-        except Exception:
+        except (requests.RequestException, OSError):
             continue
 
         soup = BeautifulSoup(html, "html.parser")
@@ -408,7 +421,7 @@ def fetch_with_playwright(
     wait_until: str,
 ) -> tuple[str, None, None]:
     try:
-        from playwright.sync_api import sync_playwright  # type: ignore
+        from playwright.sync_api import sync_playwright  # type: ignore  # pylint: disable=import-outside-toplevel
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "Playwright not installed. Install with: pip install playwright && playwright install chromium"
@@ -557,7 +570,7 @@ def write_report(report_path: Path, results: List[dict]) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = report_path.suffix.lower()
     if suffix == ".csv":
-        import csv
+        import csv  # pylint: disable=import-outside-toplevel
 
         fieldnames = sorted({k for r in results for k in r.keys()})
         with report_path.open("w", newline="", encoding="utf-8") as fh:
@@ -577,9 +590,10 @@ def main() -> int:
         return 1
 
     if args.use_browser:
-        try:
-            from playwright.sync_api import sync_playwright  # type: ignore  # noqa: F401
-        except ImportError as exc:  # pragma: no cover - optional dependency guard
+        # Check Playwright availability without importing unused symbols
+        import importlib.util  # pylint: disable=import-outside-toplevel
+
+        if importlib.util.find_spec("playwright.sync_api") is None:
             print(
                 "Playwright not installed. Install with: pip install playwright && playwright install chromium",
                 file=sys.stderr,
@@ -656,7 +670,7 @@ def main() -> int:
         try:
             write_report(args.report, results)
             print(f"Wrote report to {args.report}")
-        except Exception as exc:  # pragma: no cover - guard
+        except (OSError, TypeError) as exc:  # pragma: no cover - guard
             print(f"Failed to write report: {exc}", file=sys.stderr)
 
     return 1 if failures else 0

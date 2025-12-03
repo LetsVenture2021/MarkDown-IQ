@@ -1,7 +1,4 @@
 import datetime as dt
-from pathlib import Path
-
-import pytest
 
 import agent
 
@@ -45,7 +42,7 @@ def test_not_modified_returns_cached_path(monkeypatch, tmp_path):
 
     monkeypatch.setattr(agent, "fetch_with_requests", fake_fetch_with_requests)
 
-    path = agent.process_url(
+    path, _, _ = agent.process_url(
         url=url,
         dest_dir=tmp_path,
         limiter=None,
@@ -56,6 +53,11 @@ def test_not_modified_returns_cached_path(monkeypatch, tmp_path):
         force=False,
         browser_timeout_ms=1000,
         browser_wait_until="load",
+        use_cache=True,
+        max_retries=0,
+        retry_backoff=0.1,
+        strip_selectors=None,
+        keep_selectors=None,
     )
 
     assert path == cached_file
