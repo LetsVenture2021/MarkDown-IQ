@@ -7,7 +7,7 @@ locally with simple metadata for downstream AI use.
 
 Use responsibly: respect robots.txt and site Terms of Service.
 """
-# pylint: disable=missing-function-docstring,missing-class-docstring,line-too-long
+# pylint: disable=missing-function-docstring,missing-class-docstring,line-too-long,invalid-name,import-outside-toplevel
 from __future__ import annotations
 
 import argparse
