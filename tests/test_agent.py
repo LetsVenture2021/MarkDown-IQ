@@ -79,7 +79,7 @@ def test_robots_policy_is_cached(monkeypatch):
         def read(self):
             called.append(self.url)
 
-    def can_fetch(self, user_agent, url):  # pylint: disable=unused-argument
+    def can_fetch(_user_agent, url):
         return url.endswith("/ok")
 
     monkeypatch.setattr(agent.robotparser, "RobotFileParser", FakeRobotParser)
