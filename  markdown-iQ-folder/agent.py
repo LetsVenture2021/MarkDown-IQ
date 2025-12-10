@@ -13,6 +13,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import mimetypes
 import re
 import sys
 import time
@@ -271,13 +272,50 @@ def extract_title(soup: BeautifulSoup) -> str:
     return "Untitled"
 
 
-def sanitize_filename(url: str, title: str) -> str:
+def sanitize_filename(url: str, title: str, extension: str = ".md") -> str:
     base = title or url
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", base).strip("-").lower()
     if not slug:
         slug = "page"
+    suffix = extension or ""
+    if suffix and not suffix.startswith("."):
+        suffix = "." + suffix
     url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
-    return f"{slug}-{url_hash}.md"
+    return f"{slug}-{url_hash}{suffix}"
+
+
+def derive_title_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    path = Path(parsed.path)
+    if path.stem:
+        return path.stem
+    if parsed.netloc:
+        return parsed.netloc
+    return "Document"
+
+
+def guess_binary_extension(content_type: str, url: str, default: str = ".bin") -> str:
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if "pdf" in ct:
+        return ".pdf"
+    if ct:
+        guessed = mimetypes.guess_extension(ct)
+        if guessed:
+            return guessed
+    parsed = urlparse(url)
+    suffix = Path(parsed.path).suffix
+    if suffix:
+        return suffix
+    return default
+
+
+def is_pdf_response(content_type: str, raw_bytes: bytes, url: str) -> bool:
+    ct = (content_type or "").lower()
+    if "pdf" in ct:
+        return True
+    if url.lower().split("?", 1)[0].endswith(".pdf"):
+        return True
+    return raw_bytes.startswith(b"%PDF") if raw_bytes else False
 
 
 def load_cache(path: Path) -> Dict[str, dict]:
@@ -397,7 +435,7 @@ def fetch_with_requests(
     cache_entry: Optional[dict],
     limiter: Optional[RateLimiter],
     force: bool = False,
-) -> tuple[str, Optional[str], Optional[str]]:
+) -> tuple[str, bytes, str, Optional[str], Optional[str]]:
     headers = {"User-Agent": USER_AGENT}
     if cache_entry and not force:
         if etag := cache_entry.get("etag"):
@@ -410,7 +448,13 @@ def fetch_with_requests(
     if resp.status_code == 304:
         raise NotModified()
     resp.raise_for_status()
-    return resp.text, resp.headers.get("ETag"), resp.headers.get("Last-Modified")
+    return (
+        resp.text,
+        resp.content,
+        resp.headers.get("Content-Type", ""),
+        resp.headers.get("ETag"),
+        resp.headers.get("Last-Modified"),
+    )
 
 
 def fetch_with_playwright(
@@ -418,7 +462,7 @@ def fetch_with_playwright(
     limiter: Optional[RateLimiter],
     timeout_ms: int,
     wait_until: str,
-) -> tuple[str, None, None]:
+) -> tuple[str, bytes, str, None, None]:
     try:
         from playwright.sync_api import sync_playwright  # type: ignore  # pylint: disable=import-outside-toplevel
     except ImportError as exc:  # pragma: no cover - optional dependency
@@ -433,7 +477,7 @@ def fetch_with_playwright(
             page.goto(url, wait_until=wait_until, timeout=timeout_ms)
             html = page.content()
             browser.close()
-    return html, None, None
+    return html, html.encode("utf-8"), "text/html", None, None
 
 
 def convert_to_markdown(
@@ -464,6 +508,28 @@ def convert_to_markdown(
     return metadata + markdown + "\n"
 
 
+def build_binary_stub_markdown(
+    title: str,
+    url: str,
+    binary_filename: str,
+    content_type: str,
+) -> str:
+    metadata = (
+        "---\n"
+        f"title: {title}\n"
+        f"source: {url}\n"
+        f"fetched_at: {dt.datetime.utcnow().isoformat()}Z\n"
+        f"content_type: {content_type or 'application/octet-stream'}\n"
+        f"local_file: {binary_filename}\n"
+        "---\n\n"
+    )
+    body = (
+        "This entry references a binary download saved alongside this file. "
+        f"Open `{binary_filename}` with a compatible viewer to inspect the original document."
+    )
+    return metadata + body + "\n"
+
+
 def write_markdown(markdown: str, dest_dir: Path, filename: str) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     path = dest_dir / filename
@@ -487,12 +553,14 @@ def process_url(
     retry_backoff: float,
     strip_selectors: Optional[List[str]],
     keep_selectors: Optional[List[str]],
-) -> tuple[Path, str, str]:
+) -> tuple[Path, str, str, Optional[Path]]:
     if robots_policy and not robots_policy.is_allowed(url):
         raise PermissionError(f"Blocked by robots.txt: {url}")
 
     cache_entry = cache.get(url) if use_cache else None
     html: Optional[str] = None
+    raw_bytes: bytes = b""
+    content_type: str = ""
     etag: Optional[str] = None
     last_modified: Optional[str] = None
 
@@ -514,16 +582,23 @@ def process_url(
         )
 
     try:
-        html, etag, last_modified = with_retries(
+        html, raw_bytes, content_type, etag, last_modified = with_retries(
             perform_fetch, max_retries=max_retries, backoff=retry_backoff, retry_exceptions=retryable
         )
     except NotModified:
         if cache_entry and (existing := cache_entry.get("filename")):
             path = dest_dir / existing
-            if path.exists():
-                return path, cache_entry.get("hash", ""), cache_entry.get("title", "")
+            binary_candidate = None
+            if binary_name := cache_entry.get("binary_filename"):
+                candidate_path = dest_dir / binary_name
+                if candidate_path.exists():
+                    binary_candidate = candidate_path
+                else:
+                    path = None  # Force refetch if binary missing
+            if path and path.exists():
+                return path, cache_entry.get("hash", ""), cache_entry.get("title", ""), binary_candidate
         # If cache said not modified but file missing, force fetch.
-        html, etag, last_modified = with_retries(
+        html, raw_bytes, content_type, etag, last_modified = with_retries(
             lambda: fetch_with_requests(
                 url,
                 cache_entry=None,
@@ -535,17 +610,58 @@ def process_url(
             retry_exceptions=retryable,
         )
 
-    html_hash = hashlib.sha256(html.encode("utf-8")).hexdigest()
-    title = extract_title(BeautifulSoup(html, "html.parser"))
+    html_text = html or ""
+    content_bytes = raw_bytes or html_text.encode("utf-8")
+    content_hash = hashlib.sha256(content_bytes).hexdigest()
+
+    if cache_entry and cache_entry.get("hash") == content_hash:
+        cached_filename = cache_entry.get("filename")
+        if cached_filename:
+            cached_path = dest_dir / cached_filename
+            binary_path: Optional[Path] = None
+            binary_name = cache_entry.get("binary_filename")
+            if binary_name:
+                candidate = dest_dir / binary_name
+                if candidate.exists():
+                    binary_path = candidate
+                else:
+                    cached_path = None
+            if cached_path and cached_path.exists():
+                return cached_path, content_hash, cache_entry.get("title", derive_title_from_url(url)), binary_path
+
+    if is_pdf_response(content_type, raw_bytes, url):
+        title = cache_entry.get("title") if cache_entry else None
+        if not title:
+            title = derive_title_from_url(url)
+        base_name = sanitize_filename(url, title, extension="")
+        markdown_filename = f"{base_name}.md"
+        binary_extension = guess_binary_extension(content_type, url, default=".pdf")
+        binary_filename = f"{base_name}{binary_extension}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        binary_path = dest_dir / binary_filename
+        binary_payload = raw_bytes or html_text.encode("utf-8")
+        binary_path.write_bytes(binary_payload)
+        markdown = build_binary_stub_markdown(title, url, binary_filename, content_type or "application/pdf")
+        markdown_path = write_markdown(markdown, dest_dir, markdown_filename)
+        if use_cache:
+            cache[url] = {
+                "etag": etag,
+                "last_modified": last_modified,
+                "filename": markdown_filename,
+                "binary_filename": binary_filename,
+                "title": title,
+                "hash": content_hash,
+                "fetched_at": dt.datetime.utcnow().isoformat() + "Z",
+            }
+            save_cache(cache_path, cache)
+        return markdown_path, content_hash, title, binary_path
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    title = extract_title(soup)
     filename = sanitize_filename(url, title)
 
-    # Skip rewrite if content hash unchanged and file exists.
-    existing_path = dest_dir / filename
-    if cache_entry and cache_entry.get("hash") == html_hash and existing_path.exists():
-        return existing_path, html_hash, title
-
     markdown = convert_to_markdown(
-        html,
+        html_text,
         url,
         strip_selectors=strip_selectors,
         keep_selectors=keep_selectors,
@@ -557,12 +673,13 @@ def process_url(
             "etag": etag,
             "last_modified": last_modified,
             "filename": filename,
+            "binary_filename": None,
             "title": title,
-            "hash": html_hash,
+            "hash": content_hash,
             "fetched_at": dt.datetime.utcnow().isoformat() + "Z",
         }
         save_cache(cache_path, cache)
-    return path, html_hash, title
+    return path, content_hash, title, None
 
 
 def write_report(report_path: Path, results: List[dict]) -> None:
@@ -579,6 +696,15 @@ def write_report(report_path: Path, results: List[dict]) -> None:
                 writer.writerow(row)
     else:
         report_path.write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def shorten_error_message(exc: Exception, limit: int = 600) -> str:
+    text = str(exc).strip()
+    if not text:
+        text = exc.__class__.__name__
+    if len(text) > limit:
+        return text[:limit] + "... (truncated)"
+    return text
 
 
 def main() -> int:
@@ -632,7 +758,7 @@ def main() -> int:
 
     for url in urls:
         try:
-            dest, html_hash, title = process_url(
+            dest, html_hash, title, binary_path = process_url(
                 url=url,
                 dest_dir=args.out_dir,
                 limiter=limiter,
@@ -650,19 +776,21 @@ def main() -> int:
                 keep_selectors=args.keep_selectors,
             )
             print(f"Saved {url} -> {dest}")
-            results.append(
-                {
-                    "url": url,
-                    "status": "ok",
-                    "path": str(dest),
-                    "hash": html_hash,
-                    "title": title,
-                }
-            )
+            result_row = {
+                "url": url,
+                "status": "ok",
+                "path": str(dest),
+                "hash": html_hash,
+                "title": title,
+            }
+            if binary_path:
+                result_row["binary_path"] = str(binary_path)
+            results.append(result_row)
         except handled_exceptions as exc:  # pragma: no cover - operational guard
             failures += 1
-            print(f"Failed to process {url}: {exc}", file=sys.stderr)
-            results.append({"url": url, "status": "error", "error": str(exc)})
+            message = shorten_error_message(exc)
+            print(f"Failed to process {url}: {message}", file=sys.stderr)
+            results.append({"url": url, "status": "error", "error": message})
 
     print(f"Completed: {len(urls) - failures} ok, {failures} failed.")
     if args.report:
